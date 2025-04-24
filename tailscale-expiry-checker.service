@@ -1,0 +1,7 @@
+[Service]
+Type=oneshot
+Restart=on-failure
+RestartSec=10s
+StartLimitInterval=10min
+StartLimitBurst=3
+ExecStart=$HOME/go/bin/tailscale-expiry-checker
