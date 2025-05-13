@@ -5,14 +5,11 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strconv"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 	"tailscale.com/client/local"
 )
-
-const NotificationIDPath = "/tmp/tailscale-expiry-checker-notification-id"
 
 func main() {
 	hours := flag.Int("hours", 24, "hours")
@@ -20,42 +17,49 @@ func main() {
 
 	ctx := context.Background()
 
+	dbusConn, err := dbus.SessionBus()
+	if err != nil {
+		fmt.Printf("Failed to connect to DBus session bus: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := dbusConn.Close(); err != nil {
+			fmt.Printf("Failed to close DBus connection: %v\n", err)
+		}
+	}()
+
+	notificationsObject := dbusConn.Object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
+	notificationID := getNotificationID()
+
 	var ts local.Client
 	status, err := ts.Status(ctx)
 	if err != nil {
-		fmt.Printf("Failed to get Tailscale status: %v", err)
+		fmt.Printf("Failed to get Tailscale status: %v\n", err)
+		os.Exit(1)
+	}
+
+	if status.BackendState == "NeedsLogin" {
+		fmt.Println("Logged out.")
+		var body string
+		if status.AuthURL != "" {
+			body = fmt.Sprintf("Log in at: %s", status.AuthURL)
+		} else {
+			body = "Tailscale is logged out."
+		}
+		sendNotification(notificationsObject, notificationID, "Needs Login", body)
+		return
+	}
+
+	if status.Self.KeyExpiry == nil {
+		fmt.Printf("Unable to get key expiry. BackendState is %s\n", status.BackendState)
 		os.Exit(1)
 	}
 
 	timeToExpiry := time.Until(*status.Self.KeyExpiry).Truncate(time.Second)
 	fmt.Printf("Tailscale node key expiring in %s\n", timeToExpiry)
 
-	dbusConn, err := dbus.SessionBus()
-	if err != nil {
-		fmt.Printf("Failed to connect to DBus session bus: %v", err)
-		os.Exit(1)
-	}
-	defer func() {
-		if err := dbusConn.Close(); err != nil {
-			fmt.Printf("Failed to close DBus connection: %v", err)
-		}
-	}()
-
-	notificationsObject := dbusConn.Object("org.freedesktop.Notifications", "/org/freedesktop/Notifications")
-
-	var notificationID uint32 = 0
-	if data, err := os.ReadFile(NotificationIDPath); err == nil {
-		if id, err := strconv.ParseUint(string(data), 10, 32); err == nil {
-			notificationID = uint32(id)
-		}
-	}
-
 	if timeToExpiry > time.Duration(*hours)*time.Hour {
-		call := notificationsObject.Call("org.freedesktop.Notifications.CloseNotification", 0, notificationID)
-		if call.Err != nil {
-			fmt.Printf("Failed to close notification: %v", call.Err)
-			os.Exit(1)
-		}
+		clearNotification(notificationsObject, notificationID)
 		return
 	}
 
@@ -65,27 +69,8 @@ func main() {
 		body = "Your node key has expired."
 	} else {
 		title = "Node Key Expiring Soon"
-		body = fmt.Sprintf("Your node key will expire in %s.\n", timeToExpiry)
+		body = fmt.Sprintf("Your node key will expire in %s.", timeToExpiry)
 	}
 
-	call := notificationsObject.Call("org.freedesktop.Notifications.Notify", 0,
-		"Tailscale Expiry Checker", // Application Name
-		notificationID,             // Notification ID
-		"tailscale",                // Icon
-		title,                      // Title
-		body,                       // Body
-		[]string{},                 // No actions
-		map[string]dbus.Variant{},  // Hints
-		int32(-1),                  // No timeout
-	)
-	if call.Err != nil {
-		fmt.Printf("Failed to send notification: %v", call.Err)
-		os.Exit(1)
-	}
-
-	err = os.WriteFile(NotificationIDPath, []byte(strconv.FormatUint(uint64(call.Body[0].(uint32)), 10)), 0644)
-	if err != nil {
-		fmt.Printf("Failed to save notification ID: %v", err)
-		os.Exit(1)
-	}
+	sendNotification(notificationsObject, notificationID, title, body)
 }
